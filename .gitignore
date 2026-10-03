@@ -1,0 +1,11 @@
+data/*
+!data/.gitkeep
+weights/
+out/
+*.zip
+*.mp4
+*.npy
+*.ply
+__pycache__/
+.venv/
+.DS_Store

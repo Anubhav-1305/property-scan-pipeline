@@ -328,7 +328,8 @@ def _boundary_segment(lab, a, b, lo, res):
     return p0, p1
 
 
-def process_lidar(cap, name, stride=8, n_sub=3, drift=True, chunk_size=15, split_rooms=True):
+def process_lidar(cap, name, stride=8, n_sub=3, drift=True, chunk_size=15, split_rooms=True,
+                 tier="lidar", prior_rel=0.0):
     """Full LiDAR-tier run on one capture -> (result dict, aligned points)."""
     from . import drift as dr
     from . import stitch as st
@@ -413,15 +414,15 @@ def process_lidar(cap, name, stride=8, n_sub=3, drift=True, chunk_size=15, split
             L = float(np.linalg.norm(b - a))
             rel = rel_y if abs(b[0] - a[0]) < abs(b[1] - a[1]) else rel_x
             walls.append(dict(index=wi, p0=a.tolist(), p1=b.tolist(),
-                              length_m=iv.ci(L, iv.length_half(L, rel, evid[wi])),
+                              length_m=iv.ci(L, iv.widen(iv.length_half(L, rel, evid[wi]), L, prior_rel)),
                               point_evidence=evid[wi]))
         area = polygon_area(poly)
         rooms.append(dict(
             name=rname, kind=kinds[ri], polygon_m=poly.tolist(), walls=walls,
             openings=[dict(type=o["type"], wall_index=o["wall_index"], p0=o["p0"], p1=o["p1"],
-                           width_m=iv.ci(o["width_m"], iv.opening_half(o["width_m"]))) for o in found],
-            floor_area_m2=iv.ci(area, iv.area_half(area, rel_a)),
-            ceiling_height_m=iv.ci(h, iv.height_half(h_std) if h is not None else None),
+                           width_m=iv.ci(o["width_m"], iv.widen(iv.opening_half(o["width_m"]), o["width_m"], prior_rel))) for o in found],
+            floor_area_m2=iv.ci(area, iv.widen(iv.area_half(area, rel_a), area, 2 * prior_rel)),
+            ceiling_height_m=iv.ci(h, iv.widen(iv.height_half(h_std), h, prior_rel) if h is not None else None),
         ))
         all_unv += unv
 
@@ -451,7 +452,7 @@ def process_lidar(cap, name, stride=8, n_sub=3, drift=True, chunk_size=15, split
                     keep.append(o)
             r["openings"] = keep
 
-    res = empty_result(name, "lidar")
+    res = empty_result(name, tier)
     res["rooms"] = rooms
     res["adjacency"] = adj
     caveats = []

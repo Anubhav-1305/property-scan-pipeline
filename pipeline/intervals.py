@@ -37,3 +37,10 @@ def area_half(value, rel_spread):
 
 def opening_half(width):
     return float(OPENING_FLOOR + 0.01 * width)
+
+
+def widen(half, value, prior_rel):
+    """Add an a-priori relative error (sensor tier prior) in quadrature."""
+    if value is None or prior_rel <= 0:
+        return half
+    return float(np.sqrt(half ** 2 + (prior_rel * value) ** 2))

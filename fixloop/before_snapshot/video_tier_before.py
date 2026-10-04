@@ -59,72 +59,40 @@ def _sharp(gray):
 ROT = {None: None, "cw": cv2.ROTATE_90_CLOCKWISE, "ccw": cv2.ROTATE_90_COUNTERCLOCKWISE, "180": cv2.ROTATE_180}
 
 
-def _prep(f, work_w, rotate):
-    if f.shape[1] > work_w:  # keep memory bounded
-        f = cv2.resize(f, (work_w, int(round(f.shape[0] * work_w / f.shape[1]))), interpolation=cv2.INTER_AREA)
-    if ROT[rotate] is not None:
-        f = cv2.rotate(f, ROT[rotate])
-    return f
-
-
-def _small_gray(f):
-    return cv2.cvtColor(cv2.resize(f, (320, int(320 * f.shape[0] / f.shape[1]))), cv2.COLOR_BGR2GRAY)
-
-
-def read_keyframes(video_path, per_sec=12.0, max_frames=450, work_w=960, rotate=None, select="sharpest"):
-    """Pick keyframes.
-
-    select="sharpest" (shipped): one frame per time window, the sharpest in the
-        window. Never leaves a time gap, so consecutive keyframes always overlap.
-    select="threshold" (original, kept for the fix-loop 'before' run): fixed stride,
-        then drop frames below 40% of median sharpness. That can delete a whole
-        run of blurry frames and leave a gap with no overlap (observed: a 64-frame
-        gap in the sample clip), which breaks tracking."""
+def read_keyframes(video_path, per_sec=12.0, max_frames=450, work_w=960, rotate=None):
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, int(round(fps / per_sec)))
     frames, idx = [], []
     i = 0
-    if select == "threshold":
-        while cap.grab():
-            if i % step == 0:
-                ok, f = cap.retrieve()
-                if ok:
-                    frames.append(_prep(f, work_w, rotate))
-                    idx.append(i)
-            i += 1
-        cap.release()
-        if not frames:
-            raise RuntimeError(f"no frames read from {video_path}")
-        sh = np.array([_sharp(_small_gray(f)) for f in frames])
-        keep = sh >= 0.4 * np.median(sh)
-        frames = [f for f, k in zip(frames, keep) if k]
-        idx = [j for j, k in zip(idx, keep) if k]
-    else:
-        best = None  # (sharpness, frame, index)
-        while cap.grab():
+    while True:
+        if not cap.grab():
+            break
+        if i % step == 0:
             ok, f = cap.retrieve()
             if ok:
-                sc = _sharp(_small_gray(f))
-                if best is None or sc > best[0]:
-                    best = (sc, f, i)
-            i += 1
-            if i % step == 0 and best is not None:
-                frames.append(_prep(best[1], work_w, rotate))
-                idx.append(best[2])
-                best = None
-        cap.release()
-        if best is not None and not frames:
-            frames.append(_prep(best[1], work_w, rotate)); idx.append(best[2])
-        if not frames:
-            raise RuntimeError(f"no frames read from {video_path}")
+                if f.shape[1] > work_w:  # keep memory bounded
+                    f = cv2.resize(f, (work_w, int(round(f.shape[0] * work_w / f.shape[1]))), interpolation=cv2.INTER_AREA)
+                if ROT[rotate] is not None:
+                    f = cv2.rotate(f, ROT[rotate])
+                frames.append(f)
+                idx.append(i)
+        i += 1
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"no frames read from {video_path}")
+    sh = np.array([_sharp(cv2.cvtColor(cv2.resize(f, (320, int(320 * f.shape[0] / f.shape[1]))), cv2.COLOR_BGR2GRAY)) for f in frames])
+    keep = sh >= 0.4 * np.median(sh)
+    frames = [f for f, k in zip(frames, keep) if k]
+    idx = [i for i, k in zip(idx, keep) if k]
     if len(frames) > max_frames:
         sel = np.linspace(0, len(frames) - 1, max_frames).astype(int)
-        frames, idx = [frames[k] for k in sel], [idx[k] for k in sel]
+        frames, idx = [frames[i] for i in sel], [idx[i] for i in sel]
     return frames, idx, fps
 
 
-def build_capture(frames, estimator, f35=F35_DEFAULT, root=".", look_back=None, log=print, mode="after"):
+def build_capture(frames, estimator, f35=F35_DEFAULT, root=".", look_back=5, log=print):
     """frames: list of BGR images (full size). Returns FramesCapture (y-up, metric)."""
     h0, w0 = frames[0].shape[:2]
     W = 640
@@ -139,8 +107,7 @@ def build_capture(frames, estimator, f35=F35_DEFAULT, root=".", look_back=None, 
         d = cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)
         grays.append(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
         depths.append(d.astype(np.float32))
-    kw = {} if look_back is None else {"look_back": look_back}
-    poses, inl, held = vo.estimate_poses(grays, depths, K, mode=mode, **kw)
+    poses, inl, held = vo.estimate_poses(grays, depths, K, look_back=look_back)
     ok = [i for i, h in enumerate(held) if not h]
     log(f"visual odometry tracked {len(ok)}/{len(frames)} frames ({sum(held)} bridged)")
     if len(ok) < 3:
@@ -158,7 +125,7 @@ def build_capture(frames, estimator, f35=F35_DEFAULT, root=".", look_back=None, 
         z = dm[v, u]
         m = (z > 0.3) & (z < 6)
         pts.append(np.c_[(u[m] - K_d[0, 2]) * z[m] / K_d[0, 0], (v[m] - K_d[1, 2]) * z[m] / K_d[1, 1], z[m]])
-    up, frac = vo.estimate_up(pts, [poses[i] for i in ok], mode=mode)
+    up, frac = vo.estimate_up(pts, [poses[i] for i in ok])
     Rg = vo.gravity_rotation(up)
     G = np.eye(4); G[:3, :3] = Rg
     wposes = [G @ poses[i] for i in ok]

@@ -1,0 +1,193 @@
+--- fixloop/before_snapshot/vo_before.py	2026-10-04 13:11:01.940937839 +0000
++++ pipeline/vo.py	2026-10-04 13:37:37.606267135 +0000
+@@ -57,7 +57,7 @@
+     return T, len(inl)
+ 
+ 
+-def estimate_poses(grays, depths, K, look_back=5, min_inliers=25, bridge="hold"):
++def _estimate_poses_before(grays, depths, K, look_back=5, min_inliers=25, bridge="hold"):
+     """grays: uint8 images; depths: depth maps resized to image size.
+     Returns (poses, inliers, held). Frame 0 is the origin.
+ 
+@@ -99,7 +99,7 @@
+     return poses, inliers, held
+ 
+ 
+-def estimate_up(points_by_frame, poses, prior=np.array([0.0, -1.0, 0.0]), tol_deg=35,
++def _estimate_up_before(points_by_frame, poses, prior=np.array([0.0, -1.0, 0.0]), tol_deg=35,
+                 iters=400, thresh=0.03, seed=0):
+     """Gravity direction in the VO world from the dominant near-horizontal plane
+     (floor in practice). `prior` is the first camera's image-up direction."""
+@@ -135,6 +135,172 @@
+     return n, best_n / len(P)
+ 
+ 
++MAX_STEP_M = 1.0
++MAX_STEP_DEG = 35.0
++
++
++def _plausible(T):
++    ang = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
++    return np.linalg.norm(T[:3, 3]) < MAX_STEP_M and ang < MAX_STEP_DEG
++
++
++def _estimate_poses_after(grays, depths, K, look_back=6, min_inliers=25, n_try=2, reloc_every=4):
++    """Segmented tracking that never trusts a guess.
++
++    * A frame is matched only against recent frames of its own segment; the match
++      must be physically plausible (step < 1 m and < 35 deg).
++    * If a frame cannot be registered at all (a blind stretch: fast turn, blank
++      wall), it starts a NEW segment with its own origin instead of inheriting a
++      guessed pose.
++    * Frames of a young segment keep trying to relocalise against frames of other
++      segments (a revisit). On success the whole segment is moved into the other
++      segment's coordinates and merged.
++    * At the end only the largest segment is kept; frames in unmerged segments are
++      reported as lost (pose None)."""
++    feats = [_features(g, 2500) for g in grays]
++    n = len(grays)
++    poses = [None] * n
++    seg = [-1] * n
++    inliers = [0] * n
++    poses[0], seg[0], inliers[0] = np.eye(4), 0, 999
++    members = {0: [0]}
++    cur = 0
++    recent = [0]  # recent frames of the current segment
++
++    def relocalise(i, avoid_seg):
++        cands = [j for s_, m in members.items() if s_ != avoid_seg for j in m]
++        if avoid_seg is not None and len(members[avoid_seg]) > look_back + 4:
++            cands += members[avoid_seg][:-(look_back + 2)]  # older frames of own segment
++        if not cands:
++            return None
++        pick = [cands[k] for k in np.linspace(0, len(cands) - 1, min(5, len(cands))).astype(int)]
++        best = None
++        for j in pick:
++            T, nn = relative_pose(feats[j], depths[j], feats[i], K, 30)
++            if T is not None and (best is None or nn > best[2]):
++                best = (np.linalg.inv(T), j, nn)
++        return best
++
++    for i in range(1, n):
++        best = None
++        for j in recent[::-1][:n_try]:
++            T, nn = relative_pose(feats[j], depths[j], feats[i], K, min_inliers)
++            if T is None or not _plausible(T):
++                continue
++            if best is None or nn > best[2]:
++                best = (np.linalg.inv(T), j, nn)
++        if best is None:
++            T, nn = relative_pose(feats[recent[-1]], depths[recent[-1]], feats[i], K, 15)
++            if T is not None and _plausible(T):
++                best = (np.linalg.inv(T), recent[-1], nn)
++        if best is not None:
++            Tab, j, nn = best
++            poses[i], seg[i], inliers[i] = poses[j] @ Tab, cur, nn
++            members[cur].append(i)
++            recent.append(i)
++            recent = recent[-look_back:]
++        else:
++            rl = relocalise(i, cur)
++            if rl is not None and seg[rl[1]] != cur:
++                Tab, j, nn = rl
++                Pi_other = poses[j] @ Tab  # frame i in the other segment's coordinates
++                members[cur].append(i)
++                poses[i], seg[i], inliers[i] = np.eye(4), cur, nn
++                M = Pi_other @ np.linalg.inv(poses[i])
++                tgt = seg[j]
++                for k in members[cur]:
++                    poses[k] = M @ poses[k]
++                    seg[k] = tgt
++                members[tgt] += members.pop(cur)
++                cur = tgt
++                recent = [i]
++            else:
++                cur = max(members) + 1  # blind stretch: new segment, own origin
++                members[cur] = [i]
++                poses[i], seg[i], inliers[i] = np.eye(4), cur, 999
++                recent = [i]
++        # a young segment keeps trying to rejoin the map
++        if cur != seg[0] and len(members[cur]) % reloc_every == 0 and len(members) > 1:
++            rl = relocalise(i, cur)
++            if rl is not None and seg[rl[1]] != cur:
++                Tab, j, nn = rl
++                Pi_other = poses[j] @ Tab
++                M = Pi_other @ np.linalg.inv(poses[i])
++                tgt = seg[j]
++                for k in members[cur]:
++                    poses[k] = M @ poses[k]
++                    seg[k] = tgt
++                members[tgt] += members.pop(cur)
++                cur = tgt
++                recent = [i]
++    main = max(members, key=lambda s_: len(members[s_]))
++    keep = set(members[main])
++    for i in range(n):
++        if i not in keep:
++            poses[i] = None
++    held = [p is None for p in poses]
++    return poses, inliers, held
++
++
++def estimate_poses(grays, depths, K, mode="after", **kw):
++    """mode='before' reproduces the original tracker (kept for the fix-loop
++    before/after run); mode='after' is the shipped fix."""
++    if mode == "before":
++        return _estimate_poses_before(grays, depths, K, **kw)
++    return _estimate_poses_after(grays, depths, K, **kw)
++
++
++def _estimate_up_after(points_by_frame, poses, prior=np.array([0.0, -1.0, 0.0]), tol_deg=35,
++                       iters=600, thresh=0.03, seed=0):
++    """Gravity from the largest near-horizontal plane that lies BELOW the camera path
++    (a floor is 0.8-2.2 m under a handheld phone; tabletops, ceilings and walls are not).
++    Refit on its inliers."""
++    rng = np.random.default_rng(seed)
++    use = [(p, T) for p, T in zip(points_by_frame, poses) if T is not None]
++    P = np.concatenate([(p @ T[:3, :3].T + T[:3, 3]) for p, T in use])
++    C = np.array([T[:3, 3] for _, T in use])
++    if len(P) > 80000:
++        P = P[rng.choice(len(P), 80000, replace=False)]
++    cos_tol = np.cos(np.deg2rad(tol_deg))
++    cmean = C.mean(0)
++    best, best_n = None, 0
++    for _ in range(iters):
++        a, b, c = P[rng.choice(len(P), 3, replace=False)]
++        n = np.cross(b - a, c - a)
++        nn = np.linalg.norm(n)
++        if nn < 1e-9:
++            continue
++        n /= nn
++        if n @ prior < 0:
++            n = -n
++        if n @ prior < cos_tol:
++            continue
++        h = (cmean - a) @ n  # camera height above this plane
++        if not 0.8 < h < 2.2:
++            continue
++        cnt = int((np.abs((P - a) @ n) < thresh).sum())
++        if cnt > best_n:
++            best, best_n = (n, a), cnt
++    if best is None:
++        return prior / np.linalg.norm(prior), 0.0
++    n, a = best
++    for _ in range(3):  # refit on inliers
++        inl = P[np.abs((P - a) @ n) < thresh]
++        c = inl.mean(0)
++        _, _, vt = np.linalg.svd(inl - c, full_matrices=False)
++        n = vt[-1]
++        if n @ prior < 0:
++            n = -n
++        a = c
++    return n, best_n / len(P)
++
++
++def estimate_up(points_by_frame, poses, mode="after", **kw):
++    if mode == "before":
++        return _estimate_up_before(points_by_frame, [p for p in poses], **kw)
++    return _estimate_up_after(points_by_frame, poses, **kw)
++
++
+ def gravity_rotation(up):
+     """Proper rotation R with R @ up = +y."""
+     y = up / np.linalg.norm(up)

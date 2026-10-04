@@ -299,24 +299,73 @@ def _extents(poly):
     return float(e[0]), float(e[1])
 
 
-def process_lidar(cap, name, stride=5, n_sub=3):
-    """Full LiDAR-tier run on one capture -> result dict (+ aligned points)."""
+def _chunks(cap, frames, chunk_size):
+    frames = list(frames)
+    out = []
+    for i in range(0, len(frames), chunk_size):
+        fr = frames[i:i + chunk_size]
+        P = fuse(cap, frames=fr, voxel=0.02)
+        if len(P) > 500:
+            out.append(dict(P=P, cam_z=cap.odometry.y.values[fr]))
+    return out
+
+
+def _boundary_segment(lab, a, b, lo, res):
+    """End points (metres, aligned frame) of the shared boundary of labels a,b."""
+    pts = []
+    for sl_a, sl_b in (((slice(None), slice(0, -1)), (slice(None), slice(1, None))),
+                       ((slice(0, -1), slice(None)), (slice(1, None), slice(None)))):
+        x, y = lab[sl_a], lab[sl_b]
+        m = ((x == a) & (y == b)) | ((x == b) & (y == a))
+        yy, xx = np.nonzero(m)
+        pts.append(np.c_[xx, yy])
+    P = np.vstack(pts) * res + lo + res / 2
+    ax = 0 if np.ptp(P[:, 0]) >= np.ptp(P[:, 1]) else 1
+    other = P[:, 1 - ax].mean()
+    p0, p1 = np.zeros(2), np.zeros(2)
+    p0[ax], p1[ax] = P[:, ax].min(), P[:, ax].max()
+    p0[1 - ax] = p1[1 - ax] = other
+    return p0, p1
+
+
+def process_lidar(cap, name, stride=8, n_sub=3, drift=True, chunk_size=15, split_rooms=True):
+    """Full LiDAR-tier run on one capture -> (result dict, aligned points)."""
+    from . import drift as dr
+    from . import stitch as st
+
     t0 = time.time()
     n = cap.n_frames
-    sub_clouds, sub_geo = [], []
+    sub_chunks = []
     for k in range(n_sub):
-        frames = range(k * stride, n, stride * n_sub)
-        Pk = fuse(cap, frames=frames)
+        sub_chunks.append(_chunks(cap, range(k * stride, n, stride * n_sub), chunk_size))
+    cam_all = cap.odometry.y.values
+
+    # global anchors from the uncorrected union
+    union0 = voxel_downsample(np.concatenate([c["P"] for ch in sub_chunks for c in ch]), 0.03)
+    floor0, ceil0, _ = find_levels(union0, cam_all)
+    top0 = (ceil0 - 0.2) if ceil0 is not None else floor0 + 1.8
+    w0 = union0[(union0[:, 2] > floor0 + 0.4) & (union0[:, 2] < top0), :2]
+    theta0 = manhattan_angle(w0)
+
+    drift_log, sub_clouds, sub_geo = [], [], []
+    for k, chunks in enumerate(sub_chunks):
+        if drift:
+            Ps, log = dr.correct(chunks, floor0, ceil0, theta0)
+            for l in log:
+                l["subset"] = k
+            drift_log += log
+        else:
+            Ps = [c["P"] for c in chunks]
+        Pk = voxel_downsample(np.concatenate(Ps), 0.02)
         sub_clouds.append(Pk)
         try:
-            g = _geometry(Pk, cap.odometry.y.values[list(frames)])
-            sub_geo.append(g)
+            sub_geo.append(_geometry(Pk, cam_all[k * stride::stride * n_sub]))
         except Exception:
             pass
     P = voxel_downsample(np.concatenate(sub_clouds), 0.02)
-    g = _geometry(P, cap.odometry.y.values)
+    g = _geometry(P, cam_all)
+    sharp = dr.wall_sharpness(P, g["floor"], g["ceil"], g["theta"])
 
-    # spreads across subsets
     def rel_std(vals):
         vals = np.array(vals, float)
         return float(vals.std() / vals.mean()) if len(vals) > 1 and vals.mean() else 0.0
@@ -327,46 +376,102 @@ def process_lidar(cap, name, stride=5, n_sub=3):
     rel_a = rel_std([s["area"] for s in sub_geo]) if sub_geo else 0.05
     hs = [s["height"] for s in sub_geo if s["height"] is not None]
     h_std = float(np.std(hs)) if len(hs) > 1 else 0.01
-
-    poly = g["poly"]
-    evid = wall_evidence(poly, g["Pa"], g["floor"], g["ceil"])
-    found, unverified = detect_openings(poly, g["Pa"], g["floor"], g["ceil"])
-
-    walls = []
-    for i in range(len(poly)):
-        a, b = poly[i], poly[(i + 1) % len(poly)]
-        L = float(np.linalg.norm(b - a))
-        rel = rel_y if abs(b[0] - a[0]) < abs(b[1] - a[1]) else rel_x
-        walls.append(dict(index=i, p0=a.tolist(), p1=b.tolist(),
-                          length_m=iv.ci(L, iv.length_half(L, rel, evid[i])),
-                          point_evidence=evid[i]))
-    openings = []
-    for o in found:
-        w = o["width_m"]
-        openings.append(dict(type=o["type"], wall_index=o["wall_index"], p0=o["p0"], p1=o["p1"],
-                             width_m=iv.ci(w, iv.opening_half(w))))
-
     h = g["height"]
-    room = dict(
-        name="Footprint",
-        polygon_m=poly.tolist(),
-        walls=walls,
-        openings=openings,
-        floor_area_m2=iv.ci(g["area"], iv.area_half(g["area"], rel_a)),
-        ceiling_height_m=iv.ci(h, iv.height_half(h_std) if h is not None else None),
-    )
+
+    # ---- rooms
+    footprint = g["poly"]
+    Pa, floor, ceil = g["Pa"], g["floor"], g["ceil"]
+    room_polys, lab, lo, ids = [footprint], None, None, [1]
+    ov = (0.0, 0.0)
+    if split_rooms:
+        mask, lo = st.footprint_mask(Pa, floor, ceil, footprint)
+        lab = st.segment(mask)
+        labels = [int(r) for r in np.unique(lab) if r > 0]
+        cand = []
+        for r in labels:
+            pg = st.region_polygon(lab, r, lo)
+            if pg is not None and len(pg) >= 4:
+                cand.append((r, snap_to_walls(pg, Pa, floor, ceil, search=0.3)))
+        if cand:
+            cand.sort(key=lambda t: -polygon_area(t[1]))
+            ids = [c[0] for c in cand]
+            polys, b4, af = st.remove_overlaps([c[1] for c in cand])
+            room_polys, ov = polys, (b4, af)
+
+    kinds = [st.classify(p) if len(room_polys) > 1 else "room" for p in room_polys]
+    counters = {"room": 0, "connector": 0}
+    rooms = []
+    all_found, all_unv = [], []
+    for ri, poly in enumerate(room_polys):
+        counters[kinds[ri]] += 1
+        rname = ("Room " if kinds[ri] == "room" else "Connector ") + str(counters[kinds[ri]])
+        evid = wall_evidence(poly, Pa, floor, ceil)
+        found, unv = detect_openings(poly, Pa, floor, ceil)
+        walls = []
+        for wi in range(len(poly)):
+            a, b = poly[wi], poly[(wi + 1) % len(poly)]
+            L = float(np.linalg.norm(b - a))
+            rel = rel_y if abs(b[0] - a[0]) < abs(b[1] - a[1]) else rel_x
+            walls.append(dict(index=wi, p0=a.tolist(), p1=b.tolist(),
+                              length_m=iv.ci(L, iv.length_half(L, rel, evid[wi])),
+                              point_evidence=evid[wi]))
+        area = polygon_area(poly)
+        rooms.append(dict(
+            name=rname, kind=kinds[ri], polygon_m=poly.tolist(), walls=walls,
+            openings=[dict(type=o["type"], wall_index=o["wall_index"], p0=o["p0"], p1=o["p1"],
+                           width_m=iv.ci(o["width_m"], iv.opening_half(o["width_m"]))) for o in found],
+            floor_area_m2=iv.ci(area, iv.area_half(area, rel_a)),
+            ceiling_height_m=iv.ci(h, iv.height_half(h_std) if h is not None else None),
+        ))
+        all_unv += unv
+
+    # ---- adjacency (passages) from shared raster boundaries
+    adj = []
+    if lab is not None and len(room_polys) > 1:
+        idx_of = {lid: i for i, lid in enumerate(ids)}
+        for (a, b), length in st.adjacency(lab).items():
+            if a in idx_of and b in idx_of and length >= 0.4:
+                p0, p1 = _boundary_segment(lab, a, b, lo, st.RES)
+                half = max(0.05, iv.opening_half(length))
+                i, j = sorted((idx_of[a], idx_of[b]))
+                adj.append(dict(rooms=[rooms[i]["name"], rooms[j]["name"]],
+                                width_m=iv.ci(length, half), p0=p0.tolist(), p1=p1.tolist(),
+                                resolution_note="raster boundary at 5 cm; interval floor 5 cm"))
+                rooms[i]["openings"].append(dict(type="passage", wall_index=None, p0=p0.tolist(),
+                                                 p1=p1.tolist(), width_m=iv.ci(length, half)))
+        # drop door/window candidates that sit on a room-to-room boundary
+        for r in rooms:
+            keep = []
+            for o in r["openings"]:
+                if o["type"] == "passage":
+                    keep.append(o); continue
+                mid = (np.array(o["p0"]) + np.array(o["p1"])) / 2
+                near = any(np.linalg.norm(mid - (np.array(a_["p0"]) + np.array(a_["p1"])) / 2) < 0.6 for a_ in adj)
+                if not near:
+                    keep.append(o)
+            r["openings"] = keep
+
     res = empty_result(name, "lidar")
-    res["rooms"] = [room]
+    res["rooms"] = rooms
+    res["adjacency"] = adj
     caveats = []
     if h is None:
         caveats.append("Ceiling not captured in this scan; ceiling height not reported.")
-    if min(evid) < 0.5:
+    if rooms and min(min(w["point_evidence"] for w in r["walls"]) for r in rooms) < 0.5:
         caveats.append("Some wall segments have little point evidence; their lengths carry widened intervals.")
+    total = sum(polygon_area(p) for p in room_polys)
     res["meta"] = dict(
-        floor_z=g["floor"], ceiling_z=g["ceil"], camera_height_above_floor=g["info"]["camera_height_above_floor"],
+        floor_z=floor, ceiling_z=ceil, camera_height_above_floor=g["info"]["camera_height_above_floor"],
         manhattan_angle_deg=float(np.rad2deg(g["theta"])),
         frames_total=n, frame_stride=stride * n_sub, n_subsets=len(sub_geo),
-        unverified_gaps=unverified, caveats=caveats,
+        total_footprint_m2=total, footprint_outline_m2=g["area"],
+        stitch=dict(n_rooms=len(rooms), overlap_before_m2=ov[0], overlap_after_m2=ov[1]),
+        drift=dict(enabled=drift, method="Manhattan heading + wall-plane registration + floor anchoring",
+                   wall_sharpness=sharp,
+                   max_abs_yaw_deg=max([abs(l["yaw_deg"]) for l in drift_log], default=0.0),
+                   max_abs_shift_m=max([max(abs(l["dx"]), abs(l["dy"])) for l in drift_log], default=0.0),
+                   chunks=drift_log),
+        unverified_gaps=all_unv, caveats=caveats,
         intervals_status="provisional (uncalibrated until benchmark phase)",
         runtime_s=round(time.time() - t0, 1),
     )

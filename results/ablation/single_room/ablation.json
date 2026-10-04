@@ -1,0 +1,27 @@
+{
+  "drift_off": {
+    "wall_sharpness": 2512.3391331628995,
+    "total_footprint_m2": 40.72313479462388,
+    "outline_perimeter_m": 27.78270613222812,
+    "outline_vertices": 6,
+    "n_rooms": 1,
+    "max_abs_yaw_correction_deg": 0.0,
+    "max_abs_shift_correction_m": 0.0,
+    "corrections_rejected": false
+  },
+  "drift_on": {
+    "wall_sharpness": 2541.170451217068,
+    "total_footprint_m2": 40.96681009597055,
+    "outline_perimeter_m": 28.04921873320912,
+    "outline_vertices": 6,
+    "n_rooms": 1,
+    "max_abs_yaw_correction_deg": 1.0,
+    "max_abs_shift_correction_m": 0.5,
+    "corrections_rejected": false
+  },
+  "delta": {
+    "wall_sharpness_ratio_on_over_off": 1.0114758862263438,
+    "footprint_area_change_pct": 0.5983706867744353,
+    "perimeter_change_pct": 0.9592751682020005
+  }
+}

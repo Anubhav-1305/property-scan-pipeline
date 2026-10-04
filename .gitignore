@@ -9,3 +9,7 @@ out/
 __pycache__/
 .venv/
 .DS_Store
+*.npz
+results/fixloop/depth_cache_*
+photos/
+photos_close/

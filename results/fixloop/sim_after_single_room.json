@@ -1,0 +1,15 @@
+{
+  "capture": "single_room",
+  "mode": "after",
+  "depth": "sim",
+  "frames_in": 428,
+  "frames_tracked": 99,
+  "frames_dropped_or_bridged": 329,
+  "ate_rmse_m": 0.037,
+  "path_length_m": 14.4,
+  "gravity_err_deg_median": 8.7,
+  "gravity_err_deg_max": 10.3,
+  "footprint_m2": 2.23,
+  "lidar_reference_m2": 40.97,
+  "footprint_error_pct": -94.5
+}
